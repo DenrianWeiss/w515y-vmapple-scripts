@@ -1,0 +1,247 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] pools: cap the DEVICE_LOCAL image slab with a heap-derived budget
+
+The registry's live-resident population is bounded by
+ResourcePools::reclaim_for_allocation_retry, which only runs when
+vkAllocateMemory returns VK_ERROR_OUT_OF_MEMORY.  On the Maleoon 920 / hvgr
+host that bound never fires: the kernel logs GPU_OVER_LIMIT past ~6 GiB of
+process GPU pages but keeps handing out memory, so a mostly idle desktop
+grew the registry to 7.2 GiB / 2 688 residents - half of them evictable by
+the engine's own predicate - until the guest panicked behind
+never-signalling fences.
+
+reclaim_over_slab_budget() moves the same lawful reclaim
+(recoverable_residents: not pinned, not sole copy, not window-held) ahead
+of the kernel's wall instead of behind a driver error that never arrives.
+It runs on the resident-admission miss path of registry_ensure, the site
+the out-of-memory arm already reclaims from, and trims the recycle pools
+for the reason that arm does.  The budget itself is a quarter of the
+device's local heap, floored at 256 MiB, narrowable (never widenable)
+through REIMS_VGPU_SLAB_BUDGET_MIB.
+
+Crossing the budget is reported as vram_budget_reclaim, always on: a
+device reclaiming under budget pressure is one whose next admissions will
+reclaim again, and a silent recovery would leave the run before it looking
+healthy.
+
+Apply in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu-config/src/lib.rs b/crates/reims-vgpu-config/src/lib.rs
+index 6e0c29ea..1e587e18 100644
+--- a/crates/reims-vgpu-config/src/lib.rs
++++ b/crates/reims-vgpu-config/src/lib.rs
+@@ -1227,6 +1227,25 @@ counts! {
+ /// `crate::runtime::gpu_hang_trail`'s ring covers every submission still in
+ /// flight instead of the last half millisecond of a batch.
+ pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
++
++/// **A count, not a switch.** How many MiB the DEVICE_LOCAL image slab may
++/// hold before a new resident admission reclaims recoverable residents,
++/// narrowing the structural budget the engine derives from the heap size.
++/// Read through [`count`], so a value above that device's budget is refused
++/// rather than obeyed.
++///
++/// It exists because "the allocator refuses" is only a bound on hosts whose
++/// driver actually refuses. The registry's live-resident population is bounded
++/// by allocation-pressure recovery (`ResourcePools::reclaim_for_allocation_retry`),
++/// and on the Maleoon 920 / hvgr host that bound never fires: the kernel logs
++/// `GPU_OVER_LIMIT` past ~6 GiB of process GPU pages but `vkAllocateMemory`
++/// keeps succeeding, so a mostly idle desktop grew its registry to 7.2 GiB -
++/// 2 688 residents, half of them evictable by the engine's own predicate -
++/// until the guest panicked behind never-signalling fences. The budget moves
++/// the same lawful reclaim (`recoverable_residents`: not pinned, not sole
++/// copy, not window-held) ahead of the kernel's wall instead of behind a
++/// driver error that never arrives.
++pub const SLAB_BUDGET_MIB: &str = "REIMS_VGPU_SLAB_BUDGET_MIB";
+ }
+ 
+ choices! {
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+index 646cd349..3cf4b2ae 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+@@ -1269,6 +1269,12 @@ impl ResourcePools {
+         // reclaims and retries on out-of-memory rather than trimming ahead of
+         // one. See `recoverable_residents`.
+         self.note_registry_reach();
++        // ... and bounded ahead of the out-of-memory wall on hosts whose
++        // kernel overcommits instead of refusing: when the image slab already
++        // holds more than its heap-derived budget, give back what
++        // `recoverable_residents` admits before this admission allocates.
++        // Same site, same safety argument as the OOM arm below.
++        self.reclaim_over_slab_budget(ctx, counters);
+         let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+             | vk::ImageUsageFlags::INPUT_ATTACHMENT
+             | vk::ImageUsageFlags::TRANSFER_SRC
+@@ -2715,6 +2727,138 @@ impl ResourcePools {
+         }
+     }
+ 
++    /// The DEVICE_LOCAL image-slab budget, in MiB, that triggers
++    /// [`Self::reclaim_over_slab_budget`] on a resident admission.
++    ///
++    /// Structural default: a quarter of the device's local heap, floored at
++    /// 256 MiB. A quarter leaves the rest of the heap for what no reclaim may
++    /// take - sole-copy residents, pinned targets, transient attachments, the
++    /// buffer pools - and stays under the per-process walls of kernels that
++    /// overcommit instead of refusing: the Maleoon 920 / hvgr host this is
++    /// measured on reports a 15 GiB heap, fires `GPU_OVER_LIMIT` at ~6 GiB of
++    /// process GPU pages, and never returns `VK_ERROR_OUT_OF_MEMORY`, which is
++    /// exactly the combination that let the registry grow to 7.2 GiB while its
++    /// only documented bound (`reclaim_for_allocation_retry`, an OOM-only
++    /// path) never ran. An operator may narrow it through
++    /// [`crate::config::SLAB_BUDGET_MIB`]; nothing may widen it.
++    ///
++    /// Read once per process: the arms differ in how much memory a workload
++    /// retains, so a boot that flipped midway would be two devices in one log
++    /// (`batch_max_draws` sets the precedent). One device exists per process;
++    /// the test contexts that share a process share a host and a heap.
++    fn image_slab_budget_mib(device_local_bytes: u64) -> u64 {
++        use std::sync::OnceLock;
++        static BUDGET: OnceLock<u64> = OnceLock::new();
++        *BUDGET.get_or_init(|| {
++            let structural = Self::slab_budget_default_mib(device_local_bytes);
++            let parsed = crate::config::count(crate::config::SLAB_BUDGET_MIB, structural);
++            let state = match &parsed {
++                crate::config::Count::Narrowed(_) => "narrowed",
++                crate::config::Count::Unset => "unset",
++                crate::config::Count::Refused(_) => "refused",
++            };
++            let budget = match parsed {
++                crate::config::Count::Narrowed(n) => n,
++                crate::config::Count::Unset => structural,
++                // Fail-visible, for the reason `batch_max_draws` refuses: a
++                // bound the operator asked for and did not get is a silent
++                // difference between what a bisect thinks it measured and
++                // what ran.
++                crate::config::Count::Refused(raw) => {
++                    crate::observe::fail(format!(
++                        "slab_budget_refused value={raw} ceiling={structural} \
++                         (a MiB count from 1 to the heap-derived budget narrows \
++                          it; anything else would widen it)"
++                    ));
++                    structural
++                }
++            };
++            crate::observe::off(format!(
++                "slab_budget_mib={budget} structural_mib={structural} \
++                 device_local_mib={} state={state}",
++                device_local_bytes >> 20,
++            ));
++            budget
++        })
++    }
++
++    /// Quarter-of-heap structural default for [`Self::image_slab_budget_mib`],
++    /// pure so the derivation is testable without a device or the environment.
++    fn slab_budget_default_mib(device_local_bytes: u64) -> u64 {
++        ((device_local_bytes >> 20) / 4).max(256)
++    }
++
++    /// Reclaim recoverable residents when the DEVICE_LOCAL image slab holds
++    /// more than its heap-derived budget - the OOM-triggered
++    /// [`Self::reclaim_for_allocation_retry`] moved ahead of a wall some
++    /// kernels enforce without ever refusing an allocation.
++    ///
++    /// Runs on the resident-admission miss path of `registry_ensure`, the same
++    /// site the out-of-memory arm reclaims from: before the caller holds any
++    /// handle and before any sampled source of this draw has been resolved,
++    /// which is the property that makes retiring live residents safe there (the
++    /// sampled-bind site is not safe, and a wrapper covering both segfaults -
++    /// see `reclaim_for_allocation_retry`). The recycle-pool half of that
++    /// function is safe at any allocation site by its own documentation, and
++    /// runs here too: a retired resident's image lands in a recycle pool with
++    /// its slab carve still held, so without the pools trim the reclaim would
++    /// free registry entries but no bytes. `trim_buffers` stays off: HOST_VISIBLE
++    /// buffers are a different memory class from the one this budget measures,
++    /// and the OOM arm forces them on only because any memory helps a refused
++    /// allocation.
++    ///
++    /// The loss is exactly the one the OOM path inflicts and the predicate
++    /// names: pixels every victim still holds in guest pages are re-read on
++    /// the victim's next use, never fabricated and never dropped. Sole-copy
++    /// residents, pinned targets and window-published surfaces are never
++    /// selected. Nothing here runs on time: a quiet workload that stays under
++    /// budget keeps every resident, and an over-budget admission with no
++    /// recoverable victims is a cheap census read and nothing else.
++    pub(super) unsafe fn reclaim_over_slab_budget(
++        &mut self,
++        ctx: &DeviceContext,
++        counters: &EngineCounters,
++    ) {
++        let budget = Self::image_slab_budget_mib(ctx.caps.memory.device_local_bytes);
++        let held = self.slab.held_bytes().0;
++        if held <= budget << 20 {
++            return;
++        }
++        let victims = self.recoverable_residents();
++        if victims.is_empty() {
++            return;
++        }
++        let held_before = held;
++        let mut freed = 0;
++        for victim in &victims {
++            if self
++                .retire_resident(ctx, victim, ResidentReclaim::AllocationReclaimed, counters)
++                .is_some()
++            {
++                freed += 1;
++            }
++        }
++        let trimmed = self.trim_recycle_pools(&ctx.device, usize::MAX, false);
++        if freed == 0 && trimmed == 0 {
++            return;
++        }
++        // Always-on: a device that reclaimed under budget pressure is one whose
++        // next admissions will reclaim again, and a silent recovery would leave
++        // the run before it looking healthy. `vram_reclaim_retry` (the OOM
++        // sibling) is the other half of the census.
++        crate::observe::fail(format!(
++            "vram_budget_reclaim residents={freed} recycled={trimmed} \
++             budget_mib={budget} held_before_mib={} held_after_mib={} \
++             sole_copy={} live={} (the DEVICE_LOCAL image slab crossed its \
++             heap-derived budget; gave back everything recoverable_residents \
++             admits - unpinned, not sole-copy, not window-held)",
++            held_before >> 20,
++            self.slab.held_bytes().0 >> 20,
++            self.registry_sole_copy.count,
++            self.registry.len(),
++        ));
++    }
++
+     /// Every resident the device may destroy without losing guest work: not
+     /// pinned, and not the only copy of its own pixels.
+     ///
+@@ -4869,6 +5145,32 @@ pub(super) mod pin_count_tests {
+         assert_eq!(pools.recoverable_residents(), vec![surf(3), surf(4)]);
+     }
+ 
++    /// The slab budget that gates `reclaim_over_slab_budget` is a quarter of
++    /// the device's local heap, floored - never a count, never a clock, so a
++    /// host with a real 15 GiB heap (Maleoon 920) budgets ~3.8 GiB while a
++    /// 4 GiB device still keeps a workable 1 GiB. This is the derivation the
++    /// measured boot relied on: the hvgr kernel overcommits a 15 GiB heap and
++    /// only warns at ~6 GiB of process pages, so a quarter is the largest
++    /// bound that fires before the kernel's wall rather than after a refusal
++    /// that never arrives.
++    #[test]
++    fn the_slab_budget_is_a_quarter_of_the_heap_with_a_floor() {
++        let mib = |bytes: u64| ResourcePools::slab_budget_default_mib(bytes);
++        assert_eq!(
++            mib(16_185_348_096),
++            3_858,
++            "the Maleoon 920 host: 15.07 GiB heap"
++        );
++        assert_eq!(mib(64 << 30), 16_384, "a 64 GiB Apple-silicon heap");
++        assert_eq!(mib(4 << 30), 1_024, "a 4 GiB heap stays above the floor");
++        assert_eq!(mib(1 << 30), 256, "the floor, not a quarter, at 1 GiB");
++        assert_eq!(
++            mib(0),
++            256,
++            "a heap the device has not reported still gets the floor"
++        );
++    }
++
+     /// Only an out-of-memory result is worth a reclaim and a retry.
+     ///
+     /// The retry exists because out-of-memory describes how much is in use at an

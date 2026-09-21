@@ -1,0 +1,193 @@
+From: keystore-fault-investigation <kirin@localhost>
+Subject: [PATCH] vmapple/aes: keep key direction/block-mode per key context; log distinct FIFO results
+
+Follow-up to 0004 (IV-context fixes). 0004 made the IV contexts
+per-context, but CMD_KEY still stored the operation direction
+(encrypt/decrypt) and block mode in *global* device state, and CMD_DATA
+read them back from there.  A live trace of a healthy boot
+(aesfix2-qemu-20260916-181114.log) shows the guest using BOTH key
+contexts with BOTH directions:
+
+    [0] builtin key 1 to decrypt with cbc   x12
+    [0] builtin key 1 to encrypt with cbc   x22
+    [1] builtin key 1 to decrypt with cbc   x12
+    [1] builtin key 1 to encrypt with cbc   x24
+    [0]/[1] new key size=16 to encrypt      x55
+
+i.e. the AppleVPKeyStore system and user sessions issue rounds on key
+context 0 and 1 with opposite directions.  MMIO accesses are serialised
+by the BQL, but a "round" (CMD_KEY ... CMD_DATA) is several MMIO writes;
+two rounds on different vCPUs can interleave between writes, in which
+case the second CMD_KEY clobbers the first round's direction/mode and
+its CMD_DATA runs with the wrong one - encrypt instead of decrypt (or
+vice versa), producing garbage CBC output and failing the wrapped-key
+integrity check: guest-side "kek failed to unwrap vek; mix-n-match?",
+volume unlock failures, and (as seen in gui-serial-20260916-163632.log)
+a half-initialised APFS crypto object whose NULL reflock pointer
+panicked the guest seconds later.  This is the same bug class as the
+0004 IV-context pair and equally interleaving-dependent, which is why
+0004-fixed builds still could not be proven free of it.
+
+Real hardware keeps direction and block mode in per-context key
+configuration registers selected by the CMD_KEY context bit, so store
+them in Key (per key context): cmd_key() writes
+s->key[ctxt].{is_encrypt,block_mode}, cmd_data() reads
+s->key[ctxt_key].{is_encrypt,block_mode}.  The builtin-key path now
+copies key material explicitly instead of struct-assigning over the
+just-written config fields.
+
+Also: aes_fifo_process' trace took `success = (res == AES_CMD_OK)`,
+which conflated AES_CMD_NEED_MORE (a multi-word payload is still
+arriving - normal) with AES_CMD_ERROR (real failure), e.g.
+"aes_fifo_process cmd=5 success=0" appeared twice per successful
+CMD_DATA.  The event now carries a string: "ok" / "need_more" / "error",
+so a result=error count > 0 is a meaningful alarm.
+
+Verified: live 600 s KVM boot of -M vmapple with aes_*/bdif_* tracing
+(logs/aesctx-*, 2026-09-16 18:30): 82 complete crypto rounds on both
+key contexts (cmd=2/5/6 result=ok x82 each), ZERO result=error, zero
+LOG_GUEST_ERROR, zero bdif read failures; serial log reached the same
+userspace phase as the panic boot (AppleVPKeyStore:3467 "user ... unlock
+successful") with ZERO "kek failed to unwrap vek" (12 in the panic
+boot), zero sel:42/sel:84 operation failures, and no kernel panic.  The
+residual "operation failed (sel: 7 ...)" + bluetoothd "unexpected
+session" lines also occur on the known-good reference stack and are
+keybag denials at the login window, not emulation faults.
+
+Apply on top of 0004 in the QEMU source root:  patch -p1 < this file
+--- a/hw/vmapple/aes.c
++++ b/hw/vmapple/aes.c
+@@ -97,6 +97,8 @@
+ 
+ typedef struct Key {
+     uint32_t key_len;
++    bool is_encrypt;
++    QCryptoCipherMode block_mode;
+     uint8_t key[32];
+ } Key;
+ 
+@@ -137,8 +139,6 @@
+     uint32_t fifo_idx;
+     Key key[2];
+     IV iv[4];
+-    bool is_encrypt;
+-    QCryptoCipherMode block_mode;
+ };
+ 
+ static void aes_update_irq(AESState *s)
+@@ -210,12 +210,18 @@
+     uint32_t ctxt = (cmd & CMD_KEY_CONTEXT_MASK) >> CMD_KEY_CONTEXT_SHIFT;
+     uint32_t key_len;
+ 
++    /*
++     * Direction and block mode are part of the key context on real
++     * hardware; keeping them per-context means rounds on different
++     * contexts may interleave (guest sessions on different vCPUs)
++     * without one round clobbering another's configuration.
++     */
+     switch ((cmd & CMD_KEY_BLOCK_MODE_MASK) >> CMD_KEY_BLOCK_MODE_SHIFT) {
+     case 0:
+-        s->block_mode = QCRYPTO_CIPHER_MODE_ECB;
++        s->key[ctxt].block_mode = QCRYPTO_CIPHER_MODE_ECB;
+         break;
+     case 1:
+-        s->block_mode = QCRYPTO_CIPHER_MODE_CBC;
++        s->key[ctxt].block_mode = QCRYPTO_CIPHER_MODE_CBC;
+         break;
+     default:
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: Unsupported block mode\n",
+@@ -223,18 +229,20 @@
+         return AES_CMD_ERROR;
+     }
+ 
+-    s->is_encrypt = cmd & CMD_KEY_ENCRYPT_MASK;
++    s->key[ctxt].is_encrypt = cmd & CMD_KEY_ENCRYPT_MASK;
+     key_len = key_lens[(cmd & CMD_KEY_KEY_LEN_MASK) >> CMD_KEY_KEY_LEN_SHIFT];
+ 
+     if (key_select) {
+         trace_aes_cmd_key_select_builtin(ctxt, key_select,
+-                                         s->is_encrypt ? "en" : "de",
+-                                         QCryptoCipherMode_str(s->block_mode));
+-        s->key[ctxt] = builtin_keys[key_select];
++                                         s->key[ctxt].is_encrypt ? "en" : "de",
++                                         QCryptoCipherMode_str(s->key[ctxt].block_mode));
++        memcpy(&s->key[ctxt].key, builtin_keys[key_select].key,
++               builtin_keys[key_select].key_len);
++        s->key[ctxt].key_len = builtin_keys[key_select].key_len;
+     } else {
+         trace_aes_cmd_key_select_new(ctxt, key_len,
+-                                     s->is_encrypt ? "en" : "de",
+-                                     QCryptoCipherMode_str(s->block_mode));
++                                     s->key[ctxt].is_encrypt ? "en" : "de",
++                                     QCryptoCipherMode_str(s->key[ctxt].block_mode));
+         if (key_len > sizeof(s->key[ctxt].key)) {
+             qemu_log_mask(LOG_GUEST_ERROR, "%s: Unsupported key length %u\n",
+                           __func__, key_len);
+@@ -344,7 +352,7 @@
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: Invalid key length\n", __func__);
+         return AES_CMD_ERROR;
+     }
+-    cipher = qcrypto_cipher_new(alg, s->block_mode,
++    cipher = qcrypto_cipher_new(alg, s->key[ctxt_key].block_mode,
+                                 s->key[ctxt_key].key,
+                                 s->key[ctxt_key].key_len, NULL);
+     if (!cipher) {
+@@ -352,14 +360,14 @@
+                       __func__);
+         return AES_CMD_ERROR;
+     }
+-    if (s->block_mode != QCRYPTO_CIPHER_MODE_ECB) {
++    if (s->key[ctxt_key].block_mode != QCRYPTO_CIPHER_MODE_ECB) {
+         if (qcrypto_cipher_setiv(cipher, (void *)s->iv[ctxt_iv].iv,
+                                  sizeof(s->iv[ctxt_iv].iv), NULL) != 0) {
+             qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to set IV\n", __func__);
+             return AES_CMD_ERROR;
+         }
+     }
+-    if (s->is_encrypt) {
++    if (s->key[ctxt_key].is_encrypt) {
+         if (qcrypto_cipher_encrypt(cipher, src->data, dst->data, len, NULL) != 0) {
+             qemu_log_mask(LOG_GUEST_ERROR, "%s: Encryption failed\n", __func__);
+             return AES_CMD_ERROR;
+@@ -430,6 +438,19 @@
+     return AES_CMD_OK;
+ }
+ 
++static const char *aes_cmd_result_str(AESCmdResult res)
++{
++    switch (res) {
++    case AES_CMD_OK:
++        return "ok";
++    case AES_CMD_NEED_MORE:
++        return "need_more";
++    case AES_CMD_ERROR:
++    default:
++        return "error";
++    }
++}
++
+ static void fifo_process(AESState *s)
+ {
+     uint32_t cmd = s->fifo[0] >> CMD_SHIFT;
+@@ -481,7 +502,7 @@
+         break;
+     }
+ 
+-    trace_aes_fifo_process(cmd, res == AES_CMD_OK);
++    trace_aes_fifo_process(cmd, aes_cmd_result_str(res));
+ }
+ 
+ static void aes1_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+diff --git a/hw/vmapple/trace-events b/hw/vmapple/trace-events
+index 93380ede14..81f308f995 100644
+--- a/hw/vmapple/trace-events
++++ b/hw/vmapple/trace-events
+@@ -9,7 +9,7 @@ aes_cmd_iv(uint32_t ctx, uint32_t iv0, uint32_t iv1, uint32_t iv2, uint32_t iv3)
+ aes_cmd_data(uint32_t key, uint32_t iv, uint64_t src, uint64_t dst, uint32_t len) "[key=%d iv=%d] src=0x%"PRIx64" dst=0x%"PRIx64" len=0x%x"
+ aes_cmd_store_iv(uint32_t ctx, uint64_t addr, uint32_t iv0, uint32_t iv1, uint32_t iv2, uint32_t iv3) "[%d] addr=0x%"PRIx64"x -> 0x%08x 0x%08x 0x%08x 0x%08x"
+ aes_cmd_flag(uint32_t raise, uint32_t flag_info) "raise=%d flag_info=0x%x"
+-aes_fifo_process(uint32_t cmd, bool success) "cmd=%d success=%d"
++aes_fifo_process(uint32_t cmd, const char *result) "cmd=%d result=%s"
+ aes_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+ aes_2_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
+ aes_2_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64

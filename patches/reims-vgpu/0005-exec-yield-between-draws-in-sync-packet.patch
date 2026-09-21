@@ -1,0 +1,45 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] exec: yield between draws of a sync exec packet
+
+A sync exec packet runs every draw of one position back to back on the
+fixed executor, and on a heavy packet (a full-frame 1920x1080 Store at
+RGBA16Float is ~8 MiB of readback plus guest writeback) that is the whole
+of sync_exec_lock_hold.  Nothing about ordering requires the executor to
+monopolise the host CPU while it waits on the GPU or copies bytes, so it
+yields every 8 ms and lets the OS schedule the other guest vCPUs, the
+window thread and the log writer.
+
+This does not shorten the packet's own latency - the draws still run
+serially in order - so it is a convoy relief, not a fix for the
+guest-visible stall; the count and reason stay on sync_exec_lock_hold.
+
+Apply on top of 0004 in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 7c78b462..dcd77288 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -5232,7 +5232,23 @@ fn finish_stream<M: HostMemory + HostOps>(
+         }
+         let input_scope = draw::BufferSnapshotScope::new();
+         let mut render_pass = crate::backend::selected().begin_render_pass();
++        // A sync exec packet runs every draw of one position back to back on the
++        // fixed executor, and on a heavy packet (a full-frame 1920x1080 Store at
++        // RGBA16Float is ~8 MiB of readback plus guest writeback, and the guest's
++        // GPU-restart watchdog prices a sync at native-GPU latency) that is the
++        // whole of `sync_exec_lock_hold`. Nothing about ordering requires the
++        // executor to monopolise the host CPU while it waits on the GPU or copies
++        // bytes: yielding between draws lets the OS schedule the other guest
++        // vCPUs, the window thread and the log writer. It does not shorten the
++        // packet's own latency - the draws still run serially in order - so this
++        // is a convoy relief, not a fix for the guest-visible stall; the count
++        // and reason stay on `sync_exec_lock_hold`.
++        let mut last_yield = std::time::Instant::now();
+         for (di, pd) in draw_list.iter().enumerate() {
++            if last_yield.elapsed().as_millis() >= 8 {
++                std::thread::yield_now();
++                last_yield = std::time::Instant::now();
++            }
+             fin.enter(crate::runtime::drain::FinishPhase::Retarget);
+             let mut req = if di == 0 {
+                 let Some(req) = first_req.take() else {

@@ -1,0 +1,112 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] gva_view: keep the released-page guard a detector, not a gate
+
+The released-pages guard arms a page on *any* unmap that names it,
+including unmaps of other ranges still aliased by this mapping.  Refusing
+a host write on that arm alone, without the reachability answer only a
+reverse map could give, declined thousands of legitimate full-frame stores
+per boot (2026-09-17: mem_write_page_released refusals, mass
+engine_drew_store_lost_it) because the guest's allocator recycles pages
+across ranges far faster than the guard's disarm saw.
+
+The page-table walk that resolves the span is the authority for whether
+the destination is still the guest's: it runs against this task's live
+model on this thread, after every map/unmap the guest has submitted.  So
+the write lands, and note_host_wrote_pages records the finding, which the
+drain tranche reports - the guard stays a detector.
+
+Apply on top of 0005 in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu/src/runtime/gva_view.rs b/crates/reims-vgpu/src/runtime/gva_view.rs
+index 5bedcf98..bc1ca973 100644
+--- a/crates/reims-vgpu/src/runtime/gva_view.rs
++++ b/crates/reims-vgpu/src/runtime/gva_view.rs
+@@ -699,10 +699,12 @@ pub fn read_span<H: HostMemory + HostOps>(
+ ///
+ /// Three steps are write-only and are keyed on the direction, not duplicated:
+ /// the [`WindowPages`] containment check, which only a deferred write carries an
+-/// authorisation set for; [`DeviceState::note_host_wrote_pages`], which
+-/// invalidates what the hypervisor's dirty bitmap cannot witness; and the
+-/// per-run footprint mark. `allowed` is ignored in the read direction because a
+-/// read authorises nothing.
++/// authorisation set for; the released-page re-check, which asks the
++/// released-pages guard whether the guest has already taken any resolved page
++/// back and refuses the whole span rather than land bytes there; and
++/// [`DeviceState::note_host_wrote_pages`], which invalidates what the
++/// hypervisor's dirty bitmap cannot witness. `allowed` is ignored in the read
++/// direction because a read authorises nothing.
+ fn span_multi<H: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut H,
+@@ -729,6 +733,19 @@ fn span_multi<H: HostMemory + HostOps>(
+         // witness. Recorded here, after the walk that names them and before any
+         // of them is written, so a refusal below costs a spurious invalidation
+         // rather than a missing one.
++        //
++        // The walk above is the authority for whether the destination is
++        // writable: it runs against this task's live page-table model on this
++        // same thread, after every map/unmap the guest has submitted, so a
++        // resolved page is one the guest's own ordering still exposes at this
++        // gva. The released-pages guard
++        // ([`crate::runtime::released_pages`]) arms a page on *any* unmap that
++        // names it, including unmaps of other ranges still aliased by this
++        // mapping - refusing on the arm alone, without the reachability answer
++        // only a reverse map could give, declined thousands of legitimate
++        // full-frame stores per boot (2026-09-17: `mem_write_page_released`
++        // refusals, mass `engine_drew_store_lost_it`). It stays a detector,
++        // reported after the fact by this note, not a gate.
+         state
+             .host_writes
+             .note_task_span(task_id, gva, length, gpas.clone());
+@@ -1207,6 +1237,51 @@ mod tests {
+         assert_eq!(back, [0xbb; 4]);
+     }
+ 
++    /// A write through a mapping the guest has kept live is ordinary work even
++    /// when another range's unmap has armed the page: the walk above is the
++    /// authority for whether the destination is still the guest's, and the
++    /// released-pages guard remains a detector - its note records the write,
++    /// and the drain tranche reports it, but the byte lands.
++    ///
++    /// This is the 2026-09-17 correction to the write-time refusal: armed-on-
++    /// its-own declined thousands of legitimate full-frame stores per boot
++    /// (`mem_write_page_released` -> `engine_drew_store_lost_it`) because the
++    /// guest's allocator recycles pages across ranges far faster than the
++    /// guard's disarm saw.
++    #[test]
++    fn an_armed_page_still_live_at_the_writing_gva_is_written_and_reported() {
++        let page_shift = PAGE_SHIFT_X86;
++        let (mut host, _root_gpa, data0, _data1, page) = pt_fixture(page_shift);
++        let mut state = state_x86();
++        state.define_task(1, page, 2);
++        let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
++
++        // Another range's unmap named this page; this gva still maps it.
++        state.host_writes.release_page(data0);
++
++        assert!(
++            write_span_within(&mut state, &mut host, 1, 8, &[0xcc; 4], Some(&armed)).is_ok(),
++            "the walk vouches for the mapping; the arm names somebody else's unmap"
++        );
++        assert!(
++            map_fresh_span_within(&mut state, &mut host, 1, 8, 16, Some(&armed)).is_some(),
++            "the packed alias path follows the same authority"
++        );
++        let mut back = [0u8; 4];
++        host.read_gpa(data0 + 8, &mut back).unwrap();
++        assert_eq!(back, [0xcc; 4], "the byte lands: the mapping is live");
++        let findings = state.host_writes.take_released_writes();
++        assert_eq!(
++            findings.len(),
++            1,
++            "the first write reports and disarms; a page reports once, not per write"
++        );
++        assert_eq!(findings[0].gpa, data0);
++        // The packed alias path's record finds the page already disarmed - one
++        // finding, not two.
++        drop(state.host_writes.take_released_writes());
++    }
++
+     /// Read the always-on log from `from` to the end.
+     fn log_tail(from: usize) -> String {
+         let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();

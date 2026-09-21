@@ -1,0 +1,876 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] kmod: add the hcr_probe module
+
+hcr_probe sets HCR_EL2.API/APK/TID3 on every vCPU entry. It is not part of
+the upstream shim set, but it is mandatory on this kernel
+(CONFIG_ARM64_PTR_AUTH=n): without it the macOS guest dies on its first PAC
+instruction, long before the XNU handoff, so the launcher loads it next to
+kvm_cache_norm / kvm_psci11 / kvm_isar1_fix.
+
+Apply from the bundle root (creates kmod/hcr_probe/):
+
+    patch -p1 < patches/kmod/0001-add-hcr-probe-module.patch
+    make -C kmod/hcr_probe KDIR=/lib/modules/$(uname -r)/build
+--- a/kmod/hcr_probe/hcr_probe.c
++++ b/kmod/hcr_probe/hcr_probe.c
+@@ -0,0 +1,766 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * hcr_probe.c - Determine whether the HCR_EL2 PAC trap and TVM actually
++ * take effect on this SoC.
++ *
++ * * Key polarity (corrected 2026-09, three independent pieces of evidence):
++ *     HCR_EL2.API(41) = 0  ->  PAC instructions at EL0/EL1 trap to EL2, ESR EC=0x09
++ *     HCR_EL2.API(41) = 1  ->  **no trap**, PAC executes natively
++ *     HCR_EL2.APK(40) = 0  ->  EL0/EL1 accesses to AP*Key_EL1 trap to EL2 (EC=0x18)
++ *     HCR_EL2.APK(40) = 1  ->  **no trap**
++ *   Evidence: (a) Arm ARM HCR_EL2 field descriptions (0b0=trap, 0b1=not trapped);
++ *         (b) qemu/target/arm/tcg/pauth_helper.c: `bool trap = !(hcr & HCR_API);`
++ *             and HELPER(pacia) checks SCTLR_EnIA first, EnIA=0 returns directly (NOP);
++ *         (c) Linux `HCR_GUEST_FLAGS` does not include API/APK (= trap on by default),
++ *             `HCR_HOST_NVHE_FLAGS` includes API|APK (= host executes natively),
++ *             `__hyp_handle_ptrauth()` sets `val |= HCR_API|HCR_APK` after the first trap
++ *             (= switch to native), and `vcpu_ptrauth_enable()` simply sets them to 1.
++ *
++ *   So "want to trap PAC instructions" requires **clearing API to 0** (not setting it
++ *   to 1); "want to trap PAC without breaking the keys" uses **API=0 + APK=1**.
++ *   This module controls hcr_api / hcr_apk independently.
++ *
++ * * The API trap is gated by SCTLR_EL1.EnIA (Arm's own words: API "is ignored if the
++ *   instruction is disabled as a result of the SCTLR_ELx.{EnIA,EnIB,EnDA,EnDB}
++ *   fields"). When EnIA=0, PAC is already a NOP and will not trap; only EnIA=1 with
++ *   API=0 traps. The APK key-access trap is not gated by the En bits.
++ *
++ * * On this kernel a trap goes all the way to arm_exit_handlers[0x09] = kvm_handle_ptrauth
++ *   (injects UNDEF). Normally a guest with vcpu_has_ptrauth is fixed up in advance by
++ *   __hyp_handle_ptrauth() in hyp; but with CONFIG_ARM64_PTR_AUTH=n,
++ *   system_has_full_ptr_auth()=false, so vcpu_has_ptrauth is always false, so
++ *   kvm_handle_ptrauth is always taken. Therefore whether the kprobe hits is exactly
++ *   "did the trap actually happen".
++ *
++ * This file is a standalone module; it does not change any default behavior of
++ * kmod/kvm_isar1_fix.c.
++ */
++#define pr_fmt(fmt) "hcr_probe: " fmt
++
++#include <linux/module.h>
++#include <linux/kprobes.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/utsname.h>
++#include <linux/atomic.h>
++#include <linux/kvm_host.h>
++#include <asm/kvm_host.h>
++
++#include "offsets.h"
++
++/* ---- HCR_EL2 bits ---- */
++#define HCR_APK_BIT	(1ULL << 40)	/* 0 = trap AP*Key_EL1 accesses         */
++#define HCR_API_BIT	(1ULL << 41)	/* 0 = trap PAC instructions            */
++#define HCR_TID3_BIT	(1ULL << 18)	/* 1 = trap ID register reads (for ISAR1 rewrite) */
++#define HCR_TVM_BIT	(1ULL << 26)	/* 1 = trap virtual-memory control register "writes" */
++#define HCR_TRVM_BIT	(1ULL << 30)	/* 1 = trap virtual-memory control register "reads"  */
++
++#define SCTLR_EL1_PAC_MASK	(0xFULL << 28)
++#define KIF_SCTLR_OFF	(KIF_GPR_OFF +					\
++			 offsetof(struct kvm_cpu_context, sys_regs) +	\
++			 SCTLR_EL1 * 8)
++
++#define ESR_EC(e)	(((e) >> 26) & 0x3f)
++#define ESR_EC_UNKNOWN	0x00
++#define ESR_EC_PAC	0x09
++#define ESR_EC_SYS64	0x18
++#define ESR_EC_FPAC	0x1c
++
++/* ================= module parameters ================= */
++/* Tri-state: pac_api/pac_apk and tvm are all -1=leave / 0=clear to 0 / 1=set to 1 */
++static int hcr_api = -1;
++module_param(hcr_api, int, 0444);
++MODULE_PARM_DESC(hcr_api, "HCR_EL2.API: -1 leave alone, 0=clear to 0 (**trap PAC instructions**), 1=set to 1 (native execution)");
++
++static int hcr_apk = -1;
++module_param(hcr_apk, int, 0444);
++MODULE_PARM_DESC(hcr_apk, "HCR_EL2.APK: -1 leave alone, 0=clear to 0 (trap key register accesses), 1=set to 1 (allow)");
++
++static int hcr_tid3 = 0;
++module_param(hcr_tid3, int, 0444);
++MODULE_PARM_DESC(hcr_tid3, "HCR_EL2.TID3: -1 leave alone, 0 leave alone, 1=set to 1 (trap ID reads, provides a positive control)");
++
++static int hcr_tvm = 0;
++module_param(hcr_tvm, int, 0444);
++MODULE_PARM_DESC(hcr_tvm, "HCR_EL2.TVM: 1=set to 1 (trap guest writes to SCTLR_EL1/TTBR/TCR/MAIR/AMAIR/CONTEXTIDR)");
++
++static bool clear_sctlr_en;		/* clear EnIA/EnIB/EnDA/EnDB in trapped SCTLR_EL1 writes after access_vm_reg returns */
++module_param(clear_sctlr_en, bool, 0444);
++MODULE_PARM_DESC(clear_sctlr_en, "Clear EnIA/EnIB/EnDA/EnDB in trapped SCTLR_EL1 writes (default 0)");
++
++static bool clear_at_entry;		/* clear the En bits in the context before every guest entry */
++module_param(clear_at_entry, bool, 0444);
++MODULE_PARM_DESC(clear_at_entry, "Clear context SCTLR_EL1 En bits before every guest entry (default 0)");
++
++/*
++ * ** The correct approach under VHE (verified 2026-09-13) **
++ *
++ * This host is VHE (E2H=1). The host runs at EL2, the guest at EL1. In this case:
++ *   - The guest's SCTLR_EL1, once the vCPU is loaded (SYSREGS_ON_CPU), is governed
++ *     **by the hardware**: access_vm_reg() writes the trapped write directly into
++ *     the hardware SCTLR_EL1, while vcpu->arch.ctxt.sys_regs[SCTLR_EL1] (= vcpu+1240)
++ *     is a **stale copy** that is written back from the hardware only in
++ *     kvm_vcpu_put_sysregs_vhe().
++ *   - Therefore "modify the in-memory copy before entering the guest" (clear_at_entry)
++ *     has no effect on the guest at all.
++ * Verified: a bare-metal guest wrote 0xf0d509d8 and read back 0xf0d509d8, while the
++ * in-memory copy seen by the kretprobe was 0x30d509d8 (old value).
++ *
++ * The two correct hooks:
++ *   clear_sctlr_reg: at the **entry** of kvm_handle_sys_reg, clear the En bits in the
++ *       guest general-purpose register xRt (the source value being written) -- then
++ *       params.regval / access_vm_reg / the hardware all receive the cleared value.
++ *   hw_clear_sctlr:  directly read/write the **hardware** SCTLR_EL1 before entering
++ *       the guest. At EL2 the SCTLR_EL12 alias (S3_5_C1_C0_0) must be used; writing
++ *       sctlr_el1 directly would write SCTLR_EL2!
++ */
++static bool clear_sctlr_reg;
++module_param(clear_sctlr_reg, bool, 0444);
++MODULE_PARM_DESC(clear_sctlr_reg, "Clear the En bits of guest xRt at kvm_handle_sys_reg entry (default 0)");
++
++/*
++ * Opposite of clear_*: force bits[31:28] (EnIA/EnIB/EnDA/EnDB) of all guest
++ * SCTLR_EL1 writes **to 1**. Used to verify the hypothesis that "XNU PAC-signs
++ * the dyld shared cache inside an En=0 window, causing the signature fields to
++ * be empty and a later EL0 braa to fail". Does not change keys or the guest image.
++ */
++static bool force_sctlr_en;
++module_param(force_sctlr_en, bool, 0444);
++MODULE_PARM_DESC(force_sctlr_en, "Force guest SCTLR_EL1 En bits to always 1 (default 0)");
++
++/* Only applies to writes with guest PC >= this value (default 0xffff000000000000 = XNU
++ * kernel only; early SCTLR writes from AVPBooter/iBoot are left alone, otherwise the
++ * booter fails to start). */
++static unsigned long long force_sctlr_en_minpc = 0xffff000000000000ULL;
++module_param(force_sctlr_en_minpc, ullong, 0444);
++MODULE_PARM_DESC(force_sctlr_en_minpc, "Guest PC lower bound for force_sctlr_en (default XNU KVA)");
++
++static bool hw_clear_sctlr;
++module_param(hw_clear_sctlr, bool, 0444);
++MODULE_PARM_DESC(hw_clear_sctlr, "Clear hardware En bits via SCTLR_EL12 before entering the guest (default 0)");
++
++/*
++ * * The hook closest to hardware truth: the **entry** of access_vm_reg(vcpu, p, r).
++ *
++ * Host disassembly (0xffffffefdf5f25e8) measured:
++ *   x0 = vcpu, x1 = struct sys_reg_params *p, x2 = struct sys_reg_desc *r
++ *   p->regval  at p+8   (ldr x4, [x4, #8])
++ *   r->reg     at r+32  (ldr w5, [x6, #32])
++ *   destination: *(u64 *)(vcpu + 1216 + r->reg*8) = p->regval
++ * So clearing the En bits of p->regval at entry means that no matter whether the
++ * path goes through memory or hardware, the cleared value is what gets used.
++ */
++static bool clear_vmreg_regval;
++module_param(clear_vmreg_regval, bool, 0444);
++MODULE_PARM_DESC(clear_vmreg_regval, "Clear params->regval En bits at access_vm_reg entry (default 0)");
++
++static bool log_vmreg_regval;
++module_param(log_vmreg_regval, bool, 0444);
++MODULE_PARM_DESC(log_vmreg_regval, "Print regval / r->reg / guest xRt received by access_vm_reg");
++
++/* Distinct SCTLR values written by the guest (up to 32), to observe XNU's value menu. */
++static u64 vmreg_hist[32];
++static int vmreg_hist_n;
++
++static bool probe_ptrauth = true;
++module_param(probe_ptrauth, bool, 0444);
++MODULE_PARM_DESC(probe_ptrauth, "kprobe kvm_handle_ptrauth (default 1): the criterion for a PAC trap");
++
++static bool probe_sys_reg = true;
++module_param(probe_sys_reg, bool, 0444);
++MODULE_PARM_DESC(probe_sys_reg, "kretprobe kvm_handle_sys_reg (default 1)");
++
++static bool probe_vm_reg = true;
++module_param(probe_vm_reg, bool, 0444);
++MODULE_PARM_DESC(probe_vm_reg, "kretprobe access_vm_reg (default 1): the criterion for TVM");
++
++static int dbg = 1;
++module_param(dbg, int, 0444);
++MODULE_PARM_DESC(dbg, "Print the first N detail lines per hook (default 1; 0=count only)");
++
++static int hcr_off = KIF_HCR_OFF;
++module_param(hcr_off, int, 0444);
++static int esr_off = KIF_ESR_OFF;
++module_param(esr_off, int, 0444);
++static int gpr_off = KIF_GPR_OFF;
++module_param(gpr_off, int, 0444);
++static int run_call_off = KIF_RUN_CALL_OFF;
++module_param(run_call_off, int, 0444);
++static int run_vcpu_reg = KIF_RUN_VCPU_REG;
++module_param(run_vcpu_reg, int, 0444);
++
++/* Debug: before entering the guest, print dump_count u64 values starting at
++ * vcpu+dump_base, to verify where the sys_regs array actually lands
++ * (for the first dump_times entries). */
++static int dump_base = -1;
++module_param(dump_base, int, 0444);
++MODULE_PARM_DESC(dump_base, "Debug: print u64 values starting at vcpu+dump_base (-1=off)");
++static int dump_count = 0;
++module_param(dump_count, int, 0444);
++static int dump_times = 1;
++module_param(dump_times, int, 0444);
++
++/* ================= counters ================= */
++static atomic64_t enter_hits = ATOMIC64_INIT(0);
++static atomic64_t hcr_rewrites = ATOMIC64_INIT(0);
++static atomic64_t ptrauth_hits = ATOMIC64_INIT(0);
++static atomic64_t sysreg_hits = ATOMIC64_INIT(0);
++static atomic64_t sysreg_sctlr_writes = ATOMIC64_INIT(0);
++static atomic64_t sysreg_key_accesses = ATOMIC64_INIT(0);
++static atomic64_t vmreg_hits = ATOMIC64_INIT(0);
++static atomic64_t vmreg_sctlr_writes = ATOMIC64_INIT(0);
++static atomic64_t sctlr_en_cleared = ATOMIC64_INIT(0);
++static atomic64_t sctlr_entry_cleared = ATOMIC64_INIT(0);
++static atomic64_t sctlr_reg_cleared = ATOMIC64_INIT(0);
++static atomic64_t hw_cleared = ATOMIC64_INIT(0);
++static atomic64_t vmreg_regval_seen = ATOMIC64_INIT(0);
++static atomic64_t vmreg_regval_cleared = ATOMIC64_INIT(0);
++static atomic64_t sctlr_en_forced = ATOMIC64_INIT(0);
++static atomic64_t hw_i_en_seen = ATOMIC64_INIT(0);	/* hardware bits[31:30] set at entry */
++static atomic64_t hw_d_en_seen = ATOMIC64_INIT(0);	/* only bits[29:28] set */
++
++/* ================= vcpu fields ================= */
++static inline u32 vcpu_esr(void *vcpu) { return READ_ONCE(*(u32 *)((char *)vcpu + esr_off)); }
++static inline u64 vcpu_hcr(void *vcpu) { return READ_ONCE(*(u64 *)((char *)vcpu + hcr_off)); }
++static inline u64 vcpu_sctlr(void *vcpu) { return READ_ONCE(*(u64 *)((char *)vcpu + KIF_SCTLR_OFF)); }
++static inline u64 vcpu_guest_pc(void *vcpu)
++{
++	return READ_ONCE(*(u64 *)((char *)vcpu + gpr_off + 31 * 8 + 8));
++}
++
++static inline bool force_en_active(void *vcpu)
++{
++	return force_sctlr_en && vcpu &&
++	       vcpu_guest_pc(vcpu) >= (u64)force_sctlr_en_minpc;
++}
++
++static inline bool esr_is_sctlr_write(u32 esr)
++{
++	if (esr & 1)
++		return false;
++	return ((esr >> 20) & 3) == 3 && ((esr >> 14) & 7) == 0 &&
++	       ((esr >> 10) & 0xf) == 1 && ((esr >> 1) & 0xf) == 0 &&
++	       ((esr >> 17) & 7) == 0;
++}
++
++/* AP*Key_EL1: Op0=3, Op1=0, CRn=2, CRm=1..3, Op2=0..3 */
++static inline bool esr_is_pauth_key(u32 esr)
++{
++	if (((esr >> 20) & 3) != 3 || ((esr >> 14) & 7) != 0)
++		return false;
++	if (((esr >> 10) & 0xf) != 2)
++		return false;
++	if (((esr >> 1) & 0xf) < 1 || ((esr >> 1) & 0xf) > 3)
++		return false;
++	return true;
++}
++
++/* ================= hook 1: before entering the guest ================= */
++static int enter_pre(struct kprobe *p, struct pt_regs *regs)
++{
++	void *vcpu = (void *)regs->regs[run_vcpu_reg];
++	u64 hcr, want;
++
++	if (!vcpu)
++		return 0;
++
++	hcr = vcpu_hcr(vcpu);
++	want = hcr;
++
++	if (hcr_api >= 0) {
++		if (hcr_api)
++			want |= HCR_API_BIT;
++		else
++			want &= ~HCR_API_BIT;
++	}
++	if (hcr_apk >= 0) {
++		if (hcr_apk)
++			want |= HCR_APK_BIT;
++		else
++			want &= ~HCR_APK_BIT;
++	}
++	if (hcr_tid3 > 0)
++		want |= HCR_TID3_BIT;
++	if (hcr_tvm > 0)
++		want |= HCR_TVM_BIT;
++
++	if (want != hcr) {
++		WRITE_ONCE(*(u64 *)((char *)vcpu + hcr_off), want);
++		atomic64_inc(&hcr_rewrites);
++		if (dbg > 0)
++			pr_emerg("ENTER hcr_el2 %#llx -> %#llx (API=%d[%s] APK=%d[%s] TID3=%d TVM=%d)\n",
++				 hcr, want,
++				 !!(want & HCR_API_BIT),
++				 (want & HCR_API_BIT) ? "native" : "TRAP",
++				 !!(want & HCR_APK_BIT),
++				 (want & HCR_APK_BIT) ? "allow" : "TRAP-KEYS",
++				 !!(want & HCR_TID3_BIT), !!(want & HCR_TVM_BIT));
++	}
++
++	if (clear_at_entry) {
++		u64 *sp = (u64 *)((char *)vcpu + KIF_SCTLR_OFF);
++		u64 v = READ_ONCE(*sp);
++
++		if (v & SCTLR_EL1_PAC_MASK) {
++			WRITE_ONCE(*sp, v & ~SCTLR_EL1_PAC_MASK);
++			if (atomic64_inc_return(&sctlr_entry_cleared) <= dbg)
++				pr_emerg("ENTRY clear SCTLR_EL1 %#llx -> %#llx (En=%llu->0)\n",
++					 v, v & ~SCTLR_EL1_PAC_MASK,
++					 (v & SCTLR_EL1_PAC_MASK) >> 28);
++		}
++	}
++
++	if (force_en_active(vcpu)) {
++		u64 *sp = (u64 *)((char *)vcpu + KIF_SCTLR_OFF);
++		u64 v = READ_ONCE(*sp);
++
++		if ((v & SCTLR_EL1_PAC_MASK) != SCTLR_EL1_PAC_MASK) {
++			WRITE_ONCE(*sp, v | SCTLR_EL1_PAC_MASK);
++			if (atomic64_inc_return(&sctlr_en_forced) <= dbg)
++				pr_emerg("ENTRY force SCTLR_EL1 %#llx -> %#llx\n",
++					 v, v | SCTLR_EL1_PAC_MASK);
++		}
++	}
++
++	if (dbg > 0 && atomic64_inc_return(&enter_hits) <= dbg)
++		pr_emerg("ENTER cpu=%d vcpu=%px hcr=%#llx sctlr_el1=%#llx (En=%llu) guest_pc=%#llx\n",
++			 raw_smp_processor_id(), vcpu, vcpu_hcr(vcpu), vcpu_sctlr(vcpu),
++			 (vcpu_sctlr(vcpu) & SCTLR_EL1_PAC_MASK) >> 28,
++			 vcpu_guest_pc(vcpu));
++
++#ifdef CONFIG_ARM64_VHE
++	if (hw_clear_sctlr) {
++		/*
++		 * Under EL2 (VHE), the SCTLR_EL12 alias is the real guest SCTLR_EL1.
++		 * Writing sctlr_el1 directly would land in SCTLR_EL2 (the host's own
++		 * MMU configuration), which is dangerous.
++		 */
++		u64 hw;
++
++		asm volatile("mrs %0, s3_5_c1_c0_0" : "=r"(hw));
++		if (hw & SCTLR_EL1_PAC_MASK) {
++			u64 nv = hw & ~SCTLR_EL1_PAC_MASK;
++
++			/* bits[31:30] are EnIA/EnIB (instruction PAC); [29:28] always read back as 1 on this machine. */
++			if (hw & (3ULL << 30))
++				atomic64_inc(&hw_i_en_seen);
++			if (hw & (3ULL << 28))
++				atomic64_inc(&hw_d_en_seen);
++			asm volatile("msr s3_5_c1_c0_0, %0\n\tisb" :: "r"(nv));
++			if (atomic64_inc_return(&hw_cleared) <= dbg)
++				pr_emerg("HW clear SCTLR_EL1 %#llx -> %#llx\n", hw, nv);
++		}
++	}
++
++	if (force_en_active(vcpu)) {
++		u64 hw;
++
++		asm volatile("mrs %0, s3_5_c1_c0_0" : "=r"(hw));
++		if ((hw & SCTLR_EL1_PAC_MASK) != SCTLR_EL1_PAC_MASK) {
++			asm volatile("msr s3_5_c1_c0_0, %0\n\tisb" ::
++				     "r"(hw | SCTLR_EL1_PAC_MASK));
++			if (atomic64_inc_return(&sctlr_en_forced) <= dbg)
++				pr_emerg("HW force SCTLR_EL1 %#llx -> %#llx\n",
++					 hw, hw | SCTLR_EL1_PAC_MASK);
++		}
++	}
++#endif
++
++	if (dump_base >= 0 && dump_count > 0 &&
++	    atomic64_read(&enter_hits) <= (u64)dump_times) {
++		u64 *d = (u64 *)((char *)vcpu + dump_base);
++		int i;
++
++		pr_emerg("DUMP vcpu=%px base=%d entry#%lld\n", vcpu, dump_base,
++			 (long long)atomic64_read(&enter_hits));
++		for (i = 0; i + 3 < dump_count; i += 4)
++			pr_emerg("  +%4d [%02d]=%#018llx [%02d]=%#018llx [%02d]=%#018llx [%02d]=%#018llx\n",
++				 dump_base + i * 8, i, d[i], i + 1, d[i + 1],
++				 i + 2, d[i + 2], i + 3, d[i + 3]);
++	}
++	return 0;
++}
++
++static struct kprobe kp_enter = {
++	.symbol_name = "kvm_arch_vcpu_ioctl_run",
++	.offset = KIF_RUN_CALL_OFF,
++	.pre_handler = enter_pre,
++};
++
++/* ================= hook 2: kvm_handle_ptrauth (criterion for a PAC trap) ================= */
++static int ptrauth_pre(struct kprobe *p, struct pt_regs *regs)
++{
++	void *vcpu = (void *)regs->regs[0];
++	u32 esr = vcpu ? vcpu_esr(vcpu) : 0;
++	long n = atomic64_inc_return(&ptrauth_hits);
++
++	pr_emerg("!!! kvm_handle_ptrauth HIT #%ld vcpu=%px esr=%#x EC=%#x guest_pc=%#llx\n",
++		 n, vcpu, esr, ESR_EC(esr), vcpu ? vcpu_guest_pc(vcpu) : 0);
++	return 0;
++}
++
++static struct kprobe kp_ptrauth = {
++	.symbol_name = "kvm_handle_ptrauth",
++	.pre_handler = ptrauth_pre,
++};
++
++/* ================= hook 3: kretprobe kvm_handle_sys_reg ================= */
++struct sysreg_inst {
++	void *vcpu;
++	u32 esr;
++};
++
++static int sysreg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct sysreg_inst *d = (struct sysreg_inst *)ri->data;
++	void *vcpu = (void *)regs->regs[0];
++	u32 esr = vcpu ? vcpu_esr(vcpu) : 0;
++
++	d->vcpu = vcpu;
++	d->esr = esr;
++
++	/*
++	 * * Before kvm_handle_sys_reg actually runs, clear the En bits in the
++	 *   guest's source register xRt. Afterwards params.regval = vcpu_get_reg(vcpu, Rt)
++	 *   picks up the cleared value, and access_vm_reg / the hardware / the memory
++	 *   copy will all carry the cleared value.
++	 *   (offset 384 = vcpu->arch.ctxt.gp_regs, verified by reading guest_pc.)
++	 */
++	if (clear_sctlr_reg && vcpu && esr_is_sctlr_write(esr)) {
++		u32 rt = esr & 0x1f;
++
++		if (rt < 31) {
++			u64 *rp = (u64 *)((char *)vcpu + gpr_off + rt * 8);
++			u64 v = READ_ONCE(*rp);
++
++			if (v & SCTLR_EL1_PAC_MASK) {
++				WRITE_ONCE(*rp, v & ~SCTLR_EL1_PAC_MASK);
++				if (atomic64_inc_return(&sctlr_reg_cleared) <= dbg)
++					pr_emerg("REG clear x%u SCTLR write %#llx -> %#llx\n",
++						 rt, v, v & ~SCTLR_EL1_PAC_MASK);
++			}
++		}
++	}
++
++	if (force_en_active(vcpu) && esr_is_sctlr_write(esr)) {
++		u32 rt = esr & 0x1f;
++
++		if (rt < 31) {
++			u64 *rp = (u64 *)((char *)vcpu + gpr_off + rt * 8);
++			u64 v = READ_ONCE(*rp);
++
++			if ((v & SCTLR_EL1_PAC_MASK) != SCTLR_EL1_PAC_MASK) {
++				WRITE_ONCE(*rp, v | SCTLR_EL1_PAC_MASK);
++				if (atomic64_inc_return(&sctlr_en_forced) <= dbg)
++					pr_emerg("REG force x%u SCTLR write %#llx -> %#llx\n",
++						 rt, v, v | SCTLR_EL1_PAC_MASK);
++			}
++		}
++	}
++	return 0;
++}
++
++static int sysreg_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct sysreg_inst *d = (struct sysreg_inst *)ri->data;
++	u64 sctlr;
++
++	if (!d->vcpu || ESR_EC(d->esr) != ESR_EC_SYS64)
++		return 0;
++
++	atomic64_inc(&sysreg_hits);
++
++	if (esr_is_pauth_key(d->esr)) {
++		long kn = atomic64_inc_return(&sysreg_key_accesses);
++		if (kn <= dbg)
++			pr_emerg("kvm_handle_sys_reg: PAuth key register access trapped (APK=0), esr=%#x #%ld\n",
++				 d->esr, kn);
++	}
++
++	if (!esr_is_sctlr_write(d->esr))
++		return 0;
++
++	atomic64_inc(&sysreg_sctlr_writes);
++	sctlr = vcpu_sctlr(d->vcpu);
++	if (atomic64_read(&sysreg_sctlr_writes) <= dbg || clear_sctlr_en)
++		pr_emerg("kvm_handle_sys_reg: SCTLR_EL1 write trapped (TVM=1), delivered=%#llx En=%llu #%lld\n",
++			 sctlr, (sctlr & SCTLR_EL1_PAC_MASK) >> 28,
++			 (long long)atomic64_read(&sysreg_sctlr_writes));
++
++	if (clear_sctlr_en && (sctlr & SCTLR_EL1_PAC_MASK)) {
++		WRITE_ONCE(*(u64 *)((char *)d->vcpu + KIF_SCTLR_OFF),
++			   sctlr & ~SCTLR_EL1_PAC_MASK);
++		atomic64_inc(&sctlr_en_cleared);
++		pr_emerg("kvm_handle_sys_reg: cleared SCTLR_EL1 En %#llx -> %#llx\n",
++			 sctlr, sctlr & ~SCTLR_EL1_PAC_MASK);
++	}
++	return 0;
++}
++
++static struct kretprobe krp_sysreg = {
++	.kp.symbol_name = "kvm_handle_sys_reg",
++	.handler = sysreg_ret,
++	.entry_handler = sysreg_entry,
++	.data_size = sizeof(struct sysreg_inst),
++	.maxactive = 64,
++};
++
++/* ================= hook 4: kretprobe access_vm_reg (most direct TVM evidence) ================= */
++static int vmreg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct sysreg_inst *d = (struct sysreg_inst *)ri->data;
++	void *vcpu = (void *)regs->regs[0];
++	u32 esr = vcpu ? vcpu_esr(vcpu) : 0;
++
++	d->vcpu = vcpu;
++	d->esr = esr;
++
++	/*
++	 * access_vm_reg(vcpu, p, r): x1 = p, x2 = r.
++	 * p->regval is at p+8, r->reg is at r+32 -- see the comment at the top of
++	 * this file (measured from host disassembly).
++	 */
++	if (vcpu && esr_is_sctlr_write(esr)) {
++		u64 *rv = (u64 *)((char *)regs->regs[1] + 8);
++		u32 rreg = READ_ONCE(*(u32 *)((char *)regs->regs[2] + 32));
++		u64 v = READ_ONCE(*rv);
++		long n = atomic64_inc_return(&vmreg_regval_seen);
++
++		if (log_vmreg_regval && n <= dbg)
++			pr_emerg("access_vm_reg ENTRY #%ld p=%px r->reg=%u p->regval=%#llx En=%llu\n",
++				 n, (void *)regs->regs[1], rreg, v,
++				 (v & SCTLR_EL1_PAC_MASK) >> 28);
++
++		/* Record all **distinct** SCTLR values the guest has written (up to 32), to see XNU's value menu */
++		if (log_vmreg_regval) {
++			int i, seen = 0;
++
++			for (i = 0; i < vmreg_hist_n; i++)
++				if (vmreg_hist[i] == v) {
++					seen = 1;
++					break;
++				}
++			if (!seen && vmreg_hist_n < (int)ARRAY_SIZE(vmreg_hist)) {
++				vmreg_hist[vmreg_hist_n++] = v;
++				pr_emerg("access_vm_reg SCTLR new value #%d %#018llx (EnIA=%llu EnIB=%llu EnDA=%llu EnDB=%llu)\n",
++					 vmreg_hist_n, v,
++					 (v >> 31) & 1, (v >> 30) & 1,
++					 (v >> 29) & 1, (v >> 28) & 1);
++			}
++		}
++
++		if (clear_vmreg_regval && (v & SCTLR_EL1_PAC_MASK)) {
++			u64 nv = v & ~SCTLR_EL1_PAC_MASK;
++
++			WRITE_ONCE(*rv, nv);
++			atomic64_inc(&vmreg_regval_cleared);
++			if (atomic64_read(&vmreg_regval_cleared) <= dbg)
++				pr_emerg("access_vm_reg ENTRY clear regval %#llx -> %#llx\n",
++					 v, nv);
++		}
++
++		if (force_en_active(vcpu) && (v & SCTLR_EL1_PAC_MASK) != SCTLR_EL1_PAC_MASK) {
++			u64 nv = v | SCTLR_EL1_PAC_MASK;
++
++			WRITE_ONCE(*rv, nv);
++			if (atomic64_inc_return(&sctlr_en_forced) <= dbg)
++				pr_emerg("access_vm_reg ENTRY force regval %#llx -> %#llx\n",
++					 v, nv);
++		}
++	}
++	return 0;
++}
++
++static int vmreg_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
++{
++	struct sysreg_inst *d = (struct sysreg_inst *)ri->data;
++
++	if (!d->vcpu)
++		return 0;
++
++	atomic64_inc(&vmreg_hits);
++	if (!esr_is_sctlr_write(d->esr))
++		return 0;
++
++	atomic64_inc(&vmreg_sctlr_writes);
++	if (atomic64_read(&vmreg_sctlr_writes) <= dbg)
++		pr_emerg("access_vm_reg: SCTLR_EL1 write #%lld esr=%#x delivered=%#llx\n",
++			 (long long)atomic64_read(&vmreg_sctlr_writes), d->esr,
++			 vcpu_sctlr(d->vcpu));
++	return 0;
++}
++
++static struct kretprobe krp_vmreg = {
++	.kp.symbol_name = "access_vm_reg",
++	.handler = vmreg_ret,
++	.entry_handler = vmreg_entry,
++	.data_size = sizeof(struct sysreg_inst),
++	.maxactive = 64,
++};
++
++/* ================= /proc/hcr_probe ================= */
++static int hcr_probe_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "params: hcr_api=%d hcr_apk=%d hcr_tid3=%d hcr_tvm=%d clear_sctlr_en=%d clear_at_entry=%d\n",
++		   hcr_api, hcr_apk, hcr_tid3, hcr_tvm, clear_sctlr_en, clear_at_entry);
++	seq_printf(m, "        clear_sctlr_reg=%d hw_clear_sctlr=%d clear_vmreg_regval=%d log_vmreg_regval=%d dbg=%d\n",
++		   clear_sctlr_reg, hw_clear_sctlr, clear_vmreg_regval,
++		   log_vmreg_regval, dbg);
++	seq_printf(m, "        force_sctlr_en=%d sctlr_en_forced=%lld\n",
++		   force_sctlr_en, (long long)atomic64_read(&sctlr_en_forced));
++	seq_printf(m, "enter_hits=%lld hcr_rewrites=%lld\n",
++		   (long long)atomic64_read(&enter_hits),
++		   (long long)atomic64_read(&hcr_rewrites));
++	seq_printf(m, "ptrauth_hits=%lld   <-- *decisive*: whether kvm_handle_ptrauth is called (should hit when HCR_API=0)\n",
++		   (long long)atomic64_read(&ptrauth_hits));
++	seq_printf(m, "sysreg_hits=%lld sysreg_sctlr_writes=%lld sysreg_key_accesses=%lld\n",
++		   (long long)atomic64_read(&sysreg_hits),
++		   (long long)atomic64_read(&sysreg_sctlr_writes),
++		   (long long)atomic64_read(&sysreg_key_accesses));
++	seq_printf(m, "vmreg_hits=%lld vmreg_sctlr_writes=%lld\n",
++		   (long long)atomic64_read(&vmreg_hits),
++		   (long long)atomic64_read(&vmreg_sctlr_writes));
++	seq_printf(m, "sctlr_en_cleared=%lld sctlr_entry_cleared=%lld\n",
++		   (long long)atomic64_read(&sctlr_en_cleared),
++		   (long long)atomic64_read(&sctlr_entry_cleared));
++	seq_printf(m, "sctlr_reg_cleared=%lld hw_cleared=%lld   <-- the two hooks that actually work under VHE\n",
++		   (long long)atomic64_read(&sctlr_reg_cleared),
++		   (long long)atomic64_read(&hw_cleared));
++	seq_printf(m, "vmreg_regval_seen=%lld vmreg_regval_cleared=%lld\n",
++		   (long long)atomic64_read(&vmreg_regval_seen),
++		   (long long)atomic64_read(&vmreg_regval_cleared));
++	seq_printf(m, "hw_i_en_seen=%lld hw_d_en_seen=%lld   <-- hardware En bit distribution at entry\n",
++		   (long long)atomic64_read(&hw_i_en_seen),
++		   (long long)atomic64_read(&hw_d_en_seen));
++	return 0;
++}
++
++static int hcr_probe_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, hcr_probe_show, NULL);
++}
++
++static const struct proc_ops hcr_probe_fops = {
++	.proc_open	= hcr_probe_open,
++	.proc_read	= seq_read,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++
++/* ================= init/exit ================= */
++static void print_summary(const char *tag)
++{
++	pr_emerg("%s: ptrauth_hits=%lld sysreg_hits=%lld (sctlr_writes=%lld key_accesses=%lld) vmreg_sctlr_writes=%lld en_cleared=%lld enter=%lld\n",
++		 tag,
++		 (long long)atomic64_read(&ptrauth_hits),
++		 (long long)atomic64_read(&sysreg_hits),
++		 (long long)atomic64_read(&sysreg_sctlr_writes),
++		 (long long)atomic64_read(&sysreg_key_accesses),
++		 (long long)atomic64_read(&vmreg_sctlr_writes),
++		 (long long)atomic64_read(&sctlr_en_cleared),
++		 (long long)atomic64_read(&enter_hits));
++}
++
++static int __init hcr_probe_init(void)
++{
++	int ret;
++
++	if (strcmp(utsname()->release, KIF_UTS_RELEASE) ||
++	    strcmp(utsname()->version, KIF_UTS_VERSION)) {
++		pr_emerg("kernel mismatch: built for '%s %s', running '%s %s'\n",
++			 KIF_UTS_RELEASE, KIF_UTS_VERSION,
++			 utsname()->release, utsname()->version);
++		return -EINVAL;
++	}
++
++	ret = register_kprobe(&kp_enter);
++	if (ret) {
++		pr_emerg("register kprobe kvm_arch_vcpu_ioctl_run+%#x failed: %d\n",
++			 run_call_off, ret);
++		return ret;
++	}
++	if (probe_ptrauth) {
++		ret = register_kprobe(&kp_ptrauth);
++		if (ret) {
++			pr_emerg("register kprobe kvm_handle_ptrauth failed: %d\n", ret);
++			unregister_kprobe(&kp_enter);
++			return ret;
++		}
++	}
++	if (probe_sys_reg) {
++		ret = register_kretprobe(&krp_sysreg);
++		if (ret) {
++			pr_emerg("register kretprobe kvm_handle_sys_reg failed: %d\n", ret);
++			goto err;
++		}
++	}
++	if (probe_vm_reg) {
++		ret = register_kretprobe(&krp_vmreg);
++		if (ret) {
++			pr_emerg("register kretprobe access_vm_reg failed: %d\n", ret);
++			goto err;
++		}
++	}
++
++	proc_create("hcr_probe", 0444, NULL, &hcr_probe_fops);
++
++	/*
++	 * Read the raw native ID registers reported by the silicon (the host
++	 * kernel runs at EL2/VHE where the ID registers are readable; these are
++	 * **raw values not sanitized from the KVM guest's point of view**).
++	 * ID_AA64ISAR1_EL1: APA[7:4] API[11:8] GPA[27:24] GPI[31:28]
++	 *   0=none, 1=FEAT_PAuth, 2=+EPAC, 3=PAuth2, 4=+FPAC, 5=+FPACCOMBINE
++	 * This decides "whether HCR_API can architecturally trap": if the silicon
++	 * reports API=0, then architecturally API/APK should be RES0 -- yet it
++	 * executes PAC instructions, which would mean the "ID register lies" and
++	 * the API/APK behavior is undefined.
++	 */
++	{
++		u64 isar1 = 0, pfr0 = 0, midr = 0;
++
++		asm volatile("mrs %0, s3_0_c0_c6_1" : "=r"(isar1)); /* ID_AA64ISAR1_EL1 */
++		asm volatile("mrs %0, s3_0_c0_c4_0" : "=r"(pfr0));  /* ID_AA64PFR0_EL1  */
++		asm volatile("mrs %0, midr_el1" : "=r"(midr));
++		pr_emerg("SILICON ID: MIDR=%#llx PFR0=%#llx ISAR1=%#llx  APA=%llu API=%llu GPA=%llu GPI=%llu\n",
++			 midr, pfr0, isar1,
++			 (isar1 >> 4) & 0xf, (isar1 >> 8) & 0xf,
++			 (isar1 >> 24) & 0xf, (isar1 >> 28) & 0xf);
++	}
++
++	pr_emerg("loaded: hcr_api=%d hcr_apk=%d hcr_tid3=%d hcr_tvm=%d clear_sctlr_en=%d clear_at_entry=%d clear_sctlr_reg=%d hw_clear_sctlr=%d clear_vmreg_regval=%d log_vmreg_regval=%d dbg=%d\n",
++		 hcr_api, hcr_apk, hcr_tid3, hcr_tvm, clear_sctlr_en, clear_at_entry,
++		 clear_sctlr_reg, hw_clear_sctlr, clear_vmreg_regval,
++		 log_vmreg_regval, dbg);
++	pr_emerg("kallsyms: kvm_handle_ptrauth=%px kvm_handle_sys_reg=%px access_vm_reg=%px | SCTLR_off=%d\n",
++		 (void *)kp_ptrauth.addr, (void *)krp_sysreg.kp.addr,
++		 (void *)krp_vmreg.kp.addr, (int)KIF_SCTLR_OFF);
++	return 0;
++
++err:
++	if (probe_sys_reg)
++		unregister_kretprobe(&krp_sysreg);
++	if (probe_ptrauth)
++		unregister_kprobe(&kp_ptrauth);
++	unregister_kprobe(&kp_enter);
++	return ret;
++}
++
++static void __exit hcr_probe_exit(void)
++{
++	print_summary("unloaded");
++	remove_proc_entry("hcr_probe", NULL);
++	if (probe_vm_reg)
++		unregister_kretprobe(&krp_vmreg);
++	if (probe_sys_reg)
++		unregister_kretprobe(&krp_sysreg);
++	if (probe_ptrauth)
++		unregister_kprobe(&kp_ptrauth);
++	unregister_kprobe(&kp_enter);
++}
++
++module_init(hcr_probe_init);
++module_exit(hcr_probe_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("hcr_probe");
++MODULE_DESCRIPTION("Decisive probe: does HCR_EL2 API/APK PAC trap (and TVM) actually work on this SoC?");
+--- a/kmod/hcr_probe/Makefile
++++ b/kmod/hcr_probe/Makefile
+@@ -0,0 +1,13 @@
++# tools/hcr_probe/Makefile - standalone build of hcr_probe.ko (does not touch kmod/Makefile, does not affect existing modules)
++obj-m += hcr_probe.o
++
++KDIR := /lib/modules/$(shell uname -r)/build
++PWD  := $(shell pwd)
++
++all:
++	$(MAKE) -C $(KDIR) M=$(PWD) modules
++
++clean:
++	$(MAKE) -C $(KDIR) M=$(PWD) clean
++
++.PHONY: all clean
+--- a/kmod/hcr_probe/offsets.h
++++ b/kmod/hcr_probe/offsets.h
+@@ -0,0 +1,20 @@
++/* tools/hcr_probe/offsets.h - same origin as kmod/offsets.h (generated by gen_offsets.py).
++ * Target kernel: 5.10.97-19-9000x #20-KYLINOS SMP PREEMPT Wed Jan 21 09:21:14 UTC 2026
++ * Copied into a standalone file so this probe module does not depend on the kmod/
++ * directory and does not modify existing modules. */
++#ifndef KIF_OFFSETS_H
++#define KIF_OFFSETS_H
++
++#define KIF_UTS_RELEASE	"5.10.97-19-9000x"
++#define KIF_UTS_VERSION	"#20-KYLINOS SMP PREEMPT Wed Jan 21 09:21:14 UTC 2026"
++
++#define KIF_HCR_OFF	2200	/* vcpu->arch.hcr_el2 */
++#define KIF_ESR_OFF	2216	/* vcpu->arch.fault.esr_el2 */
++#define KIF_GPR_OFF	384	/* vcpu->arch.ctxt.gp_regs (struct kvm_cpu_context) */
++
++/* Offset of the world-switch call point (bl __kvm_vcpu_run) inside kvm_arch_vcpu_ioctl_run */
++#define KIF_RUN_CALL_OFF	1748	/* at the bl instruction: before entering the guest */
++#define KIF_RUN_POST_OFF	1752	/* bl+4: after leaving the guest */
++#define KIF_RUN_VCPU_REG	28	/* register holding vcpu at that point (x28) */
++
++#endif
+--- a/kmod/hcr_probe/README.md
++++ b/kmod/hcr_probe/README.md
+@@ -0,0 +1,52 @@
++# kmod/hcr_probe - HCR_EL2.API/APK(TVM) PAC trap module
++
++Standalone kmod; does not modify `kmod/kvm_isar1_fix.c`. It is added to the
++bundle by `patches/kmod/0001-add-hcr-probe-module.patch`.
++
++## Why it is needed
++
++On this kernel (`CONFIG_ARM64_PTR_AUTH=n`) the host KVM does not virtualise the
++Apple PAC keys, so `hcr_probe` sets `HCR_EL2.API/APK/TID3` on every vCPU entry.
++Without it the guest dies on the first PAC instruction, long before the XNU
++handoff. The launcher loads it together with `kvm_cache_norm`, `kvm_psci11` and
++`kvm_isar1_fix` (`KMOD_HCR=0` skips it, `KMOD_LOAD=0` skips all four).
++
++## Polarity to remember first
++
++| Bit | Value | Effect |
++|----|----|------|
++| `HCR_EL2.API` (41) | 0 | **trap** PAC instructions to EL2 (ESR EC=0x09 -> `kvm_handle_ptrauth` -> inject UNDEF) |
++| `HCR_EL2.API` (41) | 1 | no trap, PAC executes natively |
++| `HCR_EL2.APK` (40) | 0 | **trap** `AP*Key_EL1` accesses (EC=0x18) |
++| `HCR_EL2.TVM` (26) | 1 | trap guest EL1 **writes** to SCTLR_EL1/TTBR0-1/TCR/ESR/FAR/AFSR/MAIR/AMAIR/CONTEXTIDR |
++| `HCR_EL2.TRVM` (30) | 1 | **reads** of the same set |
++
++The API trap only happens when `SCTLR_EL1.EnIA=1` (with En=0, PAC is already a
++NOP).
++
++## Build / load
++
++```bash
++# from the bundle root, after applying patches/kmod/0001-add-hcr-probe-module.patch
++make -C kmod/hcr_probe KDIR=/lib/modules/$(uname -r)/build
++
++sudo insmod kmod/hcr_probe/hcr_probe.ko hcr_api=1 hcr_apk=1 hcr_tid3=1
++```
++
++Read counters via `cat /proc/hcr_probe` or `dmesg | grep hcr_probe`.
++
++## Module parameters
++
++| Parameter | Values | Description |
++|------|------|------|
++| `hcr_api` | -1/0/1 | HCR_EL2.API: -1 leave alone, 0=**enable trap**, 1=native |
++| `hcr_apk` | -1/0/1 | HCR_EL2.APK: -1 leave alone, 0=trap key accesses, 1=allow |
++| `hcr_tid3` | 0/1 | Set TID3 (trap ID reads; needed for the ISAR1 rewrite) |
++| `hcr_tvm` | 0/1 | Set TVM (trap SCTLR_EL1 etc. writes) |
++| `clear_sctlr_en` | bool | Clear EnIA/EnIB/EnDA/EnDB in trapped SCTLR_EL1 writes |
++| `clear_at_entry` | bool | Clear context En bits before every guest entry |
++| `probe_ptrauth` / `probe_sys_reg` / `probe_vm_reg` | bool | switches for the individual hooks |
++| `dbg` | int | Print the first N detail lines per hook |
++
++The module verifies the `uname` fingerprint (same origin as `kmod/extra/offsets.h`)
++and refuses to load if it does not match.

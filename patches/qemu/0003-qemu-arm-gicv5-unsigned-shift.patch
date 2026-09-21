@@ -1,0 +1,19 @@
+qemu hw/intc/arm_gicv5.c: (0x23b << 31) overflows a signed int; gcc 10
+diagnoses it and QEMU builds with -Werror. Upstream relies on the
+modulo-2^32 result, so make the arithmetic explicitly unsigned:
+identical low 32 bits, no warning. Apply in the QEMU source root:
+patch -p1 < this file
+
+diff --git a/hw/intc/arm_gicv5.c b/hw/intc/arm_gicv5.c
+index 6b1dd04991..bc1a813cb7 100644
+--- a/hw/intc/arm_gicv5.c
++++ b/hw/intc/arm_gicv5.c
+@@ -313,7 +313,7 @@ FIELD(ICSR, HM, 5, 1)
+ FIELD(ICSR, PRIORITY, 11, 5)
+ FIELD(ICSR, IAFFID, 32, 16)
+ 
+-#define IRS_DEVARCH_VALUE ((0x23b << 31) | (0x1 << 20) | 0x5a19)
++#define IRS_DEVARCH_VALUE ((0x23bu << 31) | (0x1u << 20) | 0x5a19u)
+ 
+ static uint32_t gicv5_idreg(int regoffset)
+ {

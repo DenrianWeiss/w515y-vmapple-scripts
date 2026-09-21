@@ -1,0 +1,56 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] drain: log the head of a payload-carrying CmdNOP
+
+CmdNOP is documented as a fence carrying stamps and no payload, and the
+drain retires its header stamps while dropping the bytes.  On the
+2026-09-17 stalled boot the guest sent it with 124/172/196-byte payloads
+on channel 1, so "no payload" is a description the guest does not always
+keep, and dropping the bytes is only the whole contract if they carry
+nothing the guest waits on.
+
+NopCarriedPayload now carries the first 16 bytes of the dropped payload,
+hex-encoded, so the next boot can classify the command form this arm does
+not decode instead of only counting it.
+
+Apply on top of 0002 in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 58da9538..659e94af 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -153,6 +153,14 @@ fn release_translation_order_holds(state: &mut DeviceState) {
+ pub(crate) struct NopCarriedPayload {
+     pub(crate) channel: u32,
+     pub(crate) plen: usize,
++    /// First bytes of the dropped payload, hex-encoded, so a boot can classify
++    /// the command form this arm does not decode. CmdNOP is documented as "a
++    /// fence carrying stamps and no payload"; the guest on the 2026-09-17
++    /// stalled boot sent it with 124/172/196-byte payloads on channel 1, and
++    /// retiring the header stamps while dropping the bytes is only the whole
++    /// contract if the payload carries nothing the guest waits on. The head is
++    /// what answers that question next time.
++    pub(crate) head_hex: String,
+ }
+ 
+ impl crate::observe::Decline for NopCarriedPayload {
+@@ -164,6 +180,7 @@ impl crate::observe::Decline for NopCarriedPayload {
+         vec![
+             ("ch", self.channel.to_string()),
+             ("plen", self.plen.to_string()),
++            ("head", self.head_hex.clone()),
+         ]
+     }
+ }
+@@ -6651,6 +6674,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
+                     &NopCarriedPayload {
+                         channel: channel_id,
+                         plen: packet.payload.len(),
++                        head_hex: packet
++                            .payload
++                            .iter()
++                            .take(16)
++                            .map(|b| format!("{b:02x}"))
++                            .collect(),
+                     },
+                 )
+                 .fail();

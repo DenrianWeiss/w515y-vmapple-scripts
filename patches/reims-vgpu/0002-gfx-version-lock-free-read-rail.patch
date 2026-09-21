@@ -1,0 +1,309 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] gfx: serve the protocol-version register lock-free (0x1034)
+
+The guest reads 0x1034 as its first matching act, before it has written
+anything.  gfx_read answered it from the device lock, so when the drain
+worker held that lock the read fell through to the gfx_read_cache, which
+had never held the register and returned 0: AppleParavirtGPU matched
+against version 0, switched its whole feature set off and never started
+(the 2026-09-17 boot stall).
+
+GfxRegs::version becomes the negotiated value's single source and an
+Arc<AtomicU32> shared with the registry slot, so device_gfx_read answers
+0x1034 from the live atomic exactly like the FIFO-read / fault / interrupt
+registers it already serves lock-free.  Negotiation still happens under
+the lock in runtime::mmio::gfx_write; the atomic only publishes it.  The
+constant EFI capability registers (mode count, mode size, stride align,
+display ports, builtin connected) are seeded into the fallback cache at
+create and reset instead - they never change, so a lock-busy read gets
+the device's own value rather than a cache-miss zero.
+
+Apply on top of 0001 in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu/src/device/mod.rs b/crates/reims-vgpu/src/device/mod.rs
+index 3cd8e2d0..56d256d4 100644
+--- a/crates/reims-vgpu/src/device/mod.rs
++++ b/crates/reims-vgpu/src/device/mod.rs
+@@ -104,6 +104,13 @@ struct BoundDevice {
+     child_doorbell_rung: Arc<AtomicU32>,
+     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
+     intr_fault: Arc<AtomicU32>,
++    /// Lock-free clone of the negotiated protocol version (0x1034): the guest's
++    /// first matching read, before it has written anything, so a contended
++    /// device lock must not turn it into a cache-miss zero (the 2026-09-17
++    /// stall: AppleParavirtGPU read 0 mid-drain and never started). The value
++    /// is still negotiated under the lock in `runtime::mmio::gfx_write`; this
++    /// only publishes it, like the four above.
++    version_live: Arc<AtomicU32>,
+     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
+     /// `writeFifo` producer spin must observe drain progress live, not a
+     /// cached snapshot from before the tranche.
+@@ -228,6 +242,34 @@ fn lock_for_drain(slot: &BoundDevice) -> iosfc_admission::StateGuard<'_, DeviceI
+     inner
+ }
+ 
++/// Offsets whose `gfx_read` values are compile-time device constants.
++///
++/// Unlike 0x1034 (negotiated, published through `version_live`) these never
++/// change, so the lock-busy read fallback is *seeded* with them at create and
++/// reset rather than given a live rail: one read per offset from the device's
++/// own MMIO layer keeps the values single-sourced, and the cache the seed lands
++/// in is exactly the fallback a contended read already takes. The mutable EFI
++/// registers (mode select, framebuffer base/length/...) stay lock-gated - their
++/// values are device state, and a stale answer there is the cache's documented
++/// risk, not a matching-time one.
++const CONSTANT_GFX_READS: [u64; 5] = [
++    crate::model::GFX_REG_EFI_MODE_COUNT,
++    crate::model::GFX_REG_EFI_MODE_SIZE,
++    crate::model::GFX_REG_EFI_STRIDE_ALIGN,
++    crate::model::GFX_REG_EFI_DISPLAY_PORTS,
++    crate::model::GFX_REG_EFI_BUILTIN_CONNECTED,
++];
++
++/// Seed `cache` with [`CONSTANT_GFX_READS`], read from `device` while the
++/// caller holds its lock (create, reset). Size 4 only: the firmware probes
++/// these as u32, and a u64 read of a u32-sized EFI descriptor is not a form
++/// the register's layout defines.
++fn seed_constant_gfx_reads(cache: &mut HashMap<(u64, u32), u64>, device: &mut Device) {
++    for offset in CONSTANT_GFX_READS {
++        cache.insert((offset, 4), device.gfx_read(offset, 4));
++    }
++}
++
+ /// Create a device. `ops` is the QEMU host-service table (nullable for tests).
+ ///
+ /// `page_shift` must be [`crate::model::PAGE_SHIFT_X86`] (12) or [`crate::model::PAGE_SHIFT_ARM64E`] (14).
+@@ -252,9 +322,13 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
+     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
++    let version_live = Arc::clone(&dev.state.gfx.version);
+     let display_control = Arc::clone(&dev.state.display.control);
+     let iosfc_regs = Arc::clone(&dev.state.iosfc);
+     let iosfc_admission = iosfc_admission::Admission::new();
++    let mut dev = dev;
++    let mut gfx_read_seed = HashMap::new();
++    seed_constant_gfx_reads(&mut gfx_read_seed, &mut dev);
+     DEVICES.lock().insert(
+         id,
+         Arc::new(BoundDevice {
+@@ -268,7 +346,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+             iosfc_admission,
+             iosfc_regs,
+             gfx_ingress: Mutex::new(VecDeque::new()),
+-            gfx_read_cache: Mutex::new(HashMap::new()),
++            gfx_read_cache: Mutex::new(gfx_read_seed),
+             gfx_read_busy_logged: AtomicBool::new(false),
+             prompt_actions: Mutex::new(VecDeque::new()),
+             display_control,
+@@ -278,6 +356,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+             child_doorbell_rung,
+             intr_fault,
+             fifo_read_live,
++            version_live,
+             present_action_pending: AtomicBool::new(false),
+             present_boundary_seen: AtomicBool::new(false),
+             reset_count: AtomicU64::new(0),
+@@ -367,7 +447,10 @@ pub fn device_reset(id: u64) -> bool {
+         d.actions.clear();
+         slot.prompt_actions.lock().clear();
+         *slot.published_cursor_glyph.lock() = crate::model::CursorState::default();
+-        slot.gfx_read_cache.lock().clear();
++        let mut gfx_read_cache = slot.gfx_read_cache.lock();
++        gfx_read_cache.clear();
++        seed_constant_gfx_reads(&mut gfx_read_cache, &mut d.device);
++        drop(gfx_read_cache);
+         slot.present_action_pending.store(false, Ordering::Release);
+         slot.present_boundary_seen.store(false, Ordering::Release);
+         crate::runtime::census::present_proxy::reset_for_device();
+@@ -397,12 +483,16 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+     }
+     use crate::model::{
+         GFX_REG_FIFO_READ, GFX_REG_INTR_FAULT, GFX_REG_INTR_STATUS_DISP, GFX_REG_INTR_STATUS_GPU,
++        GFX_REG_VERSION,
+     };
+     let slot = device_slot(id)?;
+     // Guest spin/ISR registers: served lock-free from the shared atomics so a
+     // drain-tranche-held device lock never turns a fresh stamp signal into a
+     // stale cached mask (0x1014/0x1018 r2c) nor hides drain progress from the
+-    // writeFifo producer spin (0x100c) or the ISR fault read (0x102c).
++    // writeFifo producer spin (0x100c), the ISR fault read (0x102c), or the
++    // protocol-version probe (0x1034) - the guest's first matching act, whose
++    // negotiated value lives behind the same lock but must answer a contended
++    // read with the current value, never a cache-miss zero.
+     if size == 4 {
+         if offset == GFX_REG_INTR_STATUS_DISP {
+             return Some(slot.intr_disp.swap(0, Ordering::AcqRel) as u64);
+@@ -416,6 +510,9 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+         if offset == GFX_REG_INTR_FAULT {
+             return Some(slot.intr_fault.load(Ordering::Acquire) as u64);
+         }
++        if offset == GFX_REG_VERSION {
++            return Some(slot.version_live.load(Ordering::Acquire) as u64);
++        }
+     }
+     if let Some(mut d) = slot.inner.try_lock() {
+         let value = d.device.gfx_read(offset, size);
+diff --git a/crates/reims-vgpu/src/device/tests.rs b/crates/reims-vgpu/src/device/tests.rs
+index 1952506a..6b0925d3 100644
+--- a/crates/reims-vgpu/src/device/tests.rs
++++ b/crates/reims-vgpu/src/device/tests.rs
+@@ -185,6 +185,57 @@ fn fifo_read_counter_is_live_while_device_lock_held() {
+     assert!(device_destroy(id));
+ }
+ 
++/// The protocol-version register (0x1034) must answer the negotiated value
++/// even while the drain worker owns the device lock. The 2026-09-17 stall:
++/// the guest's first matching read hit a busy lock, the read cache had never
++/// held the register, and the read returned 0 - AppleParavirtGPU matched
++/// against version 0, switched its whole feature set off, and never started.
++#[test]
++fn version_read_is_live_while_device_lock_held() {
++    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
++    // Negotiate before taking the lock, as the guest does.
++    assert!(device_gfx_write(id, 0x1034, 62, 4));
++    assert_eq!(device_gfx_read(id, 0x1034, 4), Some(62));
++
++    let slot = device_slot(id).expect("slot");
++    let _drain_guard = slot.inner.lock();
++    assert_eq!(
++        device_gfx_read(id, 0x1034, 4),
++        Some(62),
++        "a contended version read must answer the negotiated value, not a cache-miss zero"
++    );
++    // Constant capability registers are seeded for exactly this contended
++    // path: no live rail, but never a lock-busy zero either.
++    assert_eq!(
++        device_gfx_read(id, crate::model::GFX_REG_EFI_MODE_COUNT, 4),
++        Some(crate::model::EFI_MODE_COUNT as u64),
++    );
++    assert_eq!(
++        device_gfx_read(id, crate::model::GFX_REG_EFI_DISPLAY_PORTS, 4),
++        Some(crate::model::EFI_DISPLAY_PORT_COUNT as u64),
++    );
++    drop(_drain_guard);
++    assert!(device_destroy(id));
++}
++
++/// A reset must leave the constant capability seeds in place: the cache is
++/// cleared, and the reseed runs under the same lock the clear already held.
++#[test]
++fn constant_capability_reads_survive_reset() {
++    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("slot");
++    assert!(device_reset(id));
++    assert!(device_gfx_write(id, 0x1034, 62, 4));
++    let slot = device_slot(id).expect("slot");
++    let _drain_guard = slot.inner.lock();
++    assert_eq!(device_gfx_read(id, 0x1034, 4), Some(62));
++    assert_eq!(
++        device_gfx_read(id, crate::model::GFX_REG_EFI_BUILTIN_CONNECTED, 4),
++        Some(crate::model::EFI_BUILTIN_CONNECTED as u64),
++    );
++    drop(_drain_guard);
++    assert!(device_destroy(id));
++}
++
+ /// Interrupt-status mask-clear writes apply lock-free too.
+ #[test]
+ fn intr_status_write_clears_mask_while_device_lock_held() {
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 770f738c..a1d3d187 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -350,7 +350,14 @@ impl crate::observe::Decline for FailEvent {
+ /// Gfx named registers + sparse backing for unnamed offsets.
+ #[derive(Clone, Debug)]
+ pub struct GfxRegs {
+-    pub version: u32,
++    /// Negotiated protocol version (0x1034). Lock-free `Arc<AtomicU32>`
++    /// shared with the registry slot: the guest reads this register as its
++    /// first matching act, before it has written anything, so a contended
++    /// device lock must not turn the read into a cache-miss zero - the 2026-09-17
++    /// boot stall, where AppleParavirtGPU read 0 mid-drain and never started.
++    /// The value is still negotiated here (`runtime::mmio::gfx_write`); the
++    /// atomic only publishes it.
++    pub version: Arc<AtomicU32>,
+     pub control_fifo: u32,
+     pub fifo_length: u32,
+     pub fifo_written: u32,
+@@ -410,7 +424,7 @@ pub struct GfxRegs {
+ impl Default for GfxRegs {
+     fn default() -> Self {
+         Self {
+-            version: 0,
++            version: Arc::new(AtomicU32::new(0)),
+             control_fifo: 0,
+             fifo_length: 0,
+             fifo_written: 0,
+@@ -4038,12 +4052,14 @@ impl DeviceState {
+         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
+         let fifo_read = Arc::clone(&self.gfx.fifo_read);
+         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
++        let version = Arc::clone(&self.gfx.version);
+         let display_control = Arc::clone(&self.display.control);
+         let iosfc = Arc::clone(&self.iosfc);
+         intr_disp.store(0, Ordering::Release);
+         intr_gpu.store(0, Ordering::Release);
+         intr_fault.store(0, Ordering::Release);
+         fifo_read.store(0, Ordering::Release);
++        version.store(0, Ordering::Release);
+         // Cleared as well as kept: a reset drops every channel, so a bit rung
+         // before it names a channel that no longer exists.
+         child_rung.store(0, Ordering::Release);
+@@ -4056,6 +4074,7 @@ impl DeviceState {
+         self.gfx.interrupt_fault = intr_fault;
+         self.gfx.fifo_read = fifo_read;
+         self.gfx.child_doorbell_rung = child_rung;
++        self.gfx.version = version;
+         self.display.control = display_control;
+     }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 58da9538..659e94af 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -4006,7 +4015,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
+                         state,
+                         request.reply_pfn,
+                     );
+-                    let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
++                    let _ = reply_device_info(
++                        host,
++                        &request,
++                        state.page_shift,
++                        state.gfx.version.load(std::sync::atomic::Ordering::Acquire),
++                    );
+                 }
+                 Some(_) => note_query_layout_mismatch("device_info", None),
+                 None => {}
+diff --git a/crates/reims-vgpu/src/runtime/mmio.rs b/crates/reims-vgpu/src/runtime/mmio.rs
+index 0812fe69..7e576bb5 100644
+--- a/crates/reims-vgpu/src/runtime/mmio.rs
++++ b/crates/reims-vgpu/src/runtime/mmio.rs
+@@ -54,7 +54,7 @@ pub fn gfx_read(state: &mut DeviceState, offset: u64, size: u32) -> u64 {
+             .interrupt_fault
+             .load(std::sync::atomic::Ordering::Acquire) as u64,
+         GFX_REG_FIFO_BASE_PAGE => state.gfx.fifo_base_page as u64,
+-        GFX_REG_VERSION => state.gfx.version as u64,
++        GFX_REG_VERSION => state.gfx.version.load(std::sync::atomic::Ordering::Acquire) as u64,
+         GFX_REG_EFI_DISPLAY => state.gfx.efi_display as u64,
+         GFX_REG_EFI_MODE_COUNT => EFI_MODE_COUNT as u64,
+         GFX_REG_EFI_MODE_SELECT => state.gfx.efi_mode_select as u64,
+@@ -171,12 +171,15 @@ pub fn gfx_write<H: HostMemory + HostOps>(
+             // until now it was an unobserved echo, so no log could say which
+             // feature set the guest ended up configuring.
+             let negotiated = negotiate_protocol_version(val);
+-            if negotiated != state.gfx.version {
++            if negotiated != state.gfx.version.load(std::sync::atomic::Ordering::Relaxed) {
+                 crate::observe::off(format!(
+                     "protocol_version requested={val} negotiated={negotiated} max={PROTOCOL_VERSION_MAX}"
+                 ));
+             }
+-            state.gfx.version = negotiated;
++            state
++                .gfx
++                .version
++                .store(negotiated, std::sync::atomic::Ordering::Release);
+             // Take the guest-RAM import here rather than letting the first
+             // gather take it. This handshake is the guest driver's first act
+             // and its display pipe does not exist yet, so the seconds the

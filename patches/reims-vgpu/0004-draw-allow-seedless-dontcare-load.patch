@@ -1,0 +1,48 @@
+From: macos15-guest-stack <kirin@localhost>
+Subject: [PATCH] draw: do not refuse a seedless DontCare colour load
+
+The native-load seed path refused every colour load whose format needs a
+native seed (or whose mip level is non-zero) and whose target_gva is set,
+because the seed request and the elision reseed are both logged refusals
+upstream.  That is the typed answer for a Load, which promised prior
+contents this device cannot produce - but a DontCare promised nothing:
+undefined contents are the contract, so it must fall through seedless and
+let the pass key resolve to Color0Load::Undefined (DONT_CARE), exactly
+like a seedless DontCare in any other format.
+
+On the driven macos-15 GUI boot every one of the 1 471
+draw_prepare_native_load_seed_unavailable refusals was a DontCare, and
+each refused draw left its fence outstanding.
+
+Apply on top of 0003 in the reims-vgpu source root:  patch -p1 < this file
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index c5cbd4a1..5d04e022 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -8589,8 +8589,24 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                         }
+                         seed_door = "native_color_seed";
+                         target_native_seed = Some(seed.clone());
+-                    } else if c0.target_gva != 0
++                    } else if matches!(declared, LoadAction::Load)
++                        && c0.target_gva != 0
+                         && (native_seed::requires_native(c0.format) || c0.guest_mip_level != 0) {
++                        // A LOAD promised prior contents this device cannot
++                        // produce: the request builder attempted the seed and
++                        // the elision reseed, and both are logged refusals
++                        // upstream. Refusing is the typed answer to that
++                        // genuinely inconsistent state. A DontCare that
++                        // reaches here promised nothing - undefined contents
++                        // are the contract - so it falls through with no
++                        // seed and the pass key resolves to
++                        // `Color0Load::Undefined` (`DONT_CARE`), exactly like
++                        // a seedless DontCare in any other format. Refusing
++                        // one of those drops a draw the guest is entitled to
++                        // have run: on the driven macos-15 GUI boot every one
++                        // of the 1 471 `draw_prepare_native_load_seed_unavailable`
++                        // refusals was a DontCare, and each refused draw left
++                        // its fence outstanding.
+                         crate::observe::fail(format!(
+                             "native_color_load_seed reason=required_seed_unavailable task={} ref={} gva={:#x} format={:#x}",
+                             req.task_id, c0.texture_ref, c0.target_gva, c0.format,

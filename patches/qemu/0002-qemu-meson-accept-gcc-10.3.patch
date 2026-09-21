@@ -1,0 +1,18 @@
+qemu meson.build: accept gcc 10.3 (Kylin V10 ships gcc-10 = 10.3.0; the
+>=10.4 gate is a blanket version check, not a feature probe). Same
+adaptation the Ventura bring-up used. Apply in the QEMU source root:
+patch -p1 < this file
+
+diff --git a/meson.build b/meson.build
+index e026851309..e94a95af0b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -327,7 +327,7 @@ endif
+ 
+ foreach lang : all_languages
+   compiler = meson.get_compiler(lang)
+-  if compiler.get_id() == 'gcc' and compiler.version().version_compare('>=10.4')
++  if compiler.get_id() == 'gcc' and compiler.version().version_compare('>=10.3')
+     # ok
+   elif compiler.get_id() == 'clang' and compiler.compiles('''
+       #ifdef __apple_build_version__
